@@ -1,25 +1,27 @@
-# Baseline Configuration - Stock train_gpt.py
+# Baseline Configuration - Stock train_gpt.py (upstream modded-nanogpt)
 # Date: 2026-02-16
 # Hardware: 1x NVIDIA H100 80GB HBM3
 
-# Model Architecture (default 774M GPT-2)
-num_layers: 12
-num_heads: 12
-head_dim: 64
+# Model Architecture (~124M param custom architecture, NOT GPT-2)
+num_layers: 11
+num_heads: 6
+head_dim: 128
 model_dim: 768
-vocab_size: 50257
+vocab_size: 50304 (padded from 50257)
+max_seq_len: 2048
+# Notable arch features: layer 6 skips attention, ReLU² MLP,
+# value embeddings, bigram hash embedding, U-net skip connections,
+# paired head attention, sparse attention gate, sliding window + YaRN
 
 # Training
-batch_size: 64 (per GPU)
-sequence_length: 1024
 total_steps: 1530
-warmup_steps: 0
-learning_rate: 0.0036 (peak, with warmup/decay schedule)
+batch_size_schedule: (131072, 262144, 393216) tokens
+grad_accum_steps: 8
+optimizer: Muon (blocks) + Adam (embed/lm_head)
 
 # Data
-dataset: fineweb10B
-train_shards: 9
-val_shards: 1
+dataset: fineweb10B (9 train shards + 1 val shard)
+val_tokens: 10485760
 
 # Precision
 dtype: bfloat16

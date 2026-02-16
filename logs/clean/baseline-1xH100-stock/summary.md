@@ -1,6 +1,7 @@
 # Baseline Run Summary
 
 **Purpose**: Validate stock train_gpt.py on single H100 instance
+**Model**: ~124M param custom arch (11 layers, 6 heads, head_dim=128, d_model=768)
 
 ## Results
 
