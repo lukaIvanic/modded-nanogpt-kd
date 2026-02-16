@@ -1,0 +1,25 @@
+# Baseline Configuration - Stock train_gpt.py
+# Date: 2026-02-16
+# Hardware: 1x NVIDIA H100 80GB HBM3
+
+# Model Architecture (default 774M GPT-2)
+num_layers: 12
+num_heads: 12
+head_dim: 64
+model_dim: 768
+vocab_size: 50257
+
+# Training
+batch_size: 64 (per GPU)
+sequence_length: 1024
+total_steps: 1530
+warmup_steps: 0
+learning_rate: 0.0036 (peak, with warmup/decay schedule)
+
+# Data
+dataset: fineweb10B
+train_shards: 9
+val_shards: 1
+
+# Precision
+dtype: bfloat16
