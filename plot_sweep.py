@@ -23,17 +23,23 @@ def parse_log(filepath):
     with open(filepath) as f:
         for line in f:
             # Parse teacher config line
-            m = re.match(r'Teacher config: (\d+)L / (\d+)H / (\d+)D / (\d+)dim / (\d+) steps', line)
+            m = re.match(r'Teacher config: (\d+)L / (\d+)H / (\d+)D / (\d+)dim / (\d+) steps(?: / bs=(\d+))?', line)
             if m:
                 config['layers'] = int(m.group(1))
                 config['heads'] = int(m.group(2))
                 config['head_dim'] = int(m.group(3))
                 config['dim'] = int(m.group(4))
                 config['steps'] = int(m.group(5))
+                if m.group(6):
+                    config['batch_size'] = int(m.group(6))
 
-            # Parse batch size from hparams logging or phase lines
+            # Parse batch size from hparams logging, phase lines, or embedded source
             m = re.match(r'batch_size[=:](\d+)', line)
-            if m:
+            if m and 'batch_size' not in config:
+                config['batch_size'] = int(m.group(1))
+            # Parse from embedded source: BATCH_SIZE=N in env or sweep runner output
+            m = re.search(r'BATCH_SIZE=(\d+)', line)
+            if m and 'batch_size' not in config:
                 config['batch_size'] = int(m.group(1))
 
             # Parse total params
@@ -41,8 +47,8 @@ def parse_log(filepath):
             if m:
                 config['params'] = m.group(1)
 
-            # Parse val loss lines: step:N/M val_loss:X.XXXX train_time:NNNms
-            m = re.match(r'step:(\d+)/(\d+) val_loss:([\d.]+) train_time:(\d+)ms', line)
+            # Parse val loss lines: step:N/M val_loss:X.XXXX train_time:NNNms step_avg:NNms
+            m = re.match(r'step:(\d+)/(\d+) val_loss:([\d.]+) train_time:(\d+)ms(?: step_avg:([\d.]+)ms)?', line)
             if m:
                 step = int(m.group(1))
                 total = int(m.group(2))
@@ -50,11 +56,17 @@ def parse_log(filepath):
                 train_time_ms = int(m.group(4))
                 val_points.append((step, val_loss, train_time_ms))
                 config['steps'] = total
+                if m.group(5):
+                    config['step_avg_ms'] = float(m.group(5))
 
             # Parse best val loss
             m = re.match(r'Best val_loss: ([\d.]+)', line)
             if m:
                 config['best_val_loss'] = float(m.group(1))
+
+    # Compute best_val_loss from val_points if not explicitly logged
+    if 'best_val_loss' not in config and val_points:
+        config['best_val_loss'] = min(p[1] for p in val_points)
 
     return config, val_points
 
@@ -63,14 +75,16 @@ def make_label(filepath, config):
     """Create a short label from config."""
     steps = config.get('steps', '?')
     best = config.get('best_val_loss', '?')
-    # Try to infer batch size from the val points timing
-    # Fallback: use filename
-    name = Path(filepath).stem[:8]
-    return f"s{steps} ({name}) best={best}"
+    if isinstance(best, float):
+        best = f"{best:.4f}"
+    bs = config.get('batch_size')
+    bs_str = f"bs={bs//1024}k" if bs else "bs=?"
+    layers = config.get('layers', '?')
+    return f"{layers}L {steps}steps {bs_str} (val={best})"
 
 
 def main():
-    pattern = sys.argv[1] if len(sys.argv) > 1 else "logs/dev/*.txt"
+    pattern = sys.argv[1] if len(sys.argv) > 1 else "logs/dev/pretrain-teacher/*.txt"
     files = sorted(glob.glob(pattern))
     if not files:
         print(f"No files found for pattern: {pattern}")
@@ -125,7 +139,8 @@ def main():
             last_time = val_points[-1][2]  # ms
             last_step = val_points[-1][0]
             step_avg_ms = last_time / max(last_step, 1)
-            tokens = [p[0] * 131072 for p in val_points[1:]]  # approximate with default BS
+            bs = config.get('batch_size', 131072)
+            tokens = [p[0] * bs for p in val_points[1:]]
             axes[1, 0].plot(tokens, l, '-o', color=color, label=label, markersize=3, linewidth=1.5)
 
         # (1,1) Step avg time over training (efficiency)

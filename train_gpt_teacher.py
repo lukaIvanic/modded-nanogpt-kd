@@ -970,8 +970,9 @@ class TrainingManager:
 logfile = None
 if master_process:
     run_id = hparams.run_id
-    os.makedirs("logs/dev", exist_ok=True)
-    logfile = f"logs/dev/{run_id}.txt"
+    log_dir = os.environ.get("LOG_DIR", "logs/dev")
+    os.makedirs(log_dir, exist_ok=True)
+    logfile = f"{log_dir}/{run_id}.txt"
     print(logfile)
 
 def print0(s, console=False):
@@ -994,7 +995,7 @@ print0(nvidia_smi())
 print0("=" * 100)
 
 model_dim = hparams.num_heads * hparams.head_dim
-print0(f"Teacher config: {hparams.num_layers}L / {hparams.num_heads}H / {hparams.head_dim}D / {model_dim}dim / {hparams.num_iterations} steps", console=True)
+print0(f"Teacher config: {hparams.num_layers}L / {hparams.num_heads}H / {hparams.head_dim}D / {model_dim}dim / {hparams.num_iterations} steps / bs={hparams.batch_size}", console=True)
 
 model: nn.Module = GPT(
     vocab_size=50257,
@@ -1089,9 +1090,11 @@ for step in range(train_steps + 1):
         step_lr = get_lr(step)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms lr_mul:{step_lr:.4f} muon_lr:{step_lr*0.023:.6f} adam_lr:{step_lr*0.008:.6f}", console=True)
 
-        # Save best checkpoint
-        if master_process and hparams.save_checkpoint and val_loss < best_val_loss:
+        # Track best val loss
+        if val_loss < best_val_loss:
             best_val_loss = val_loss
+        # Save best checkpoint
+        if master_process and hparams.save_checkpoint and val_loss <= best_val_loss:
             os.makedirs(hparams.checkpoint_dir, exist_ok=True)
             ckpt = dict(
                 step=step, val_loss=float(val_loss),
