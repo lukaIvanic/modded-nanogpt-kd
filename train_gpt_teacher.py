@@ -16,7 +16,8 @@ Environment variables:
     NUM_HEADS        (default: 6)
     HEAD_DIM         (default: 128)
     NUM_ITERATIONS   (default: 250)
-    COOLDOWN_FRAC    (default: 0.55)
+    BATCH_SIZE       (default: 8*2048*8 = 131072)
+    WARMUP_FRAC      (default: 0.05)
     VAL_LOSS_EVERY   (default: 25)
     SAVE_CHECKPOINT  (default: 1)
     CHECKPOINT_DIR   (default: checkpoints/teacher)
@@ -878,8 +879,8 @@ class TeacherHyperparameters:
     head_dim: int = int(os.environ.get("HEAD_DIM", 128))
     # schedule
     num_iterations: int = int(os.environ.get("NUM_ITERATIONS", 250))
-    cooldown_frac: float = float(os.environ.get("COOLDOWN_FRAC", 0.55))
-    batch_sizes: tuple = (8 * 2048 * 8, 16 * 2048 * 8, 24 * 2048 * 8)  # 3-phase: (131072, 262144, 393216)
+    batch_size: int = int(os.environ.get("BATCH_SIZE", str(8 * 2048 * 8)))
+    warmup_frac: float = float(os.environ.get("WARMUP_FRAC", "0.05"))
     # logging and checkpoints
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 25))
@@ -890,29 +891,13 @@ hparams = TeacherHyperparameters()
 train_max_seq_len = 896  # fixed for teacher (always in W0)
 
 
-def get_batch_size(step: int) -> int:
-    """Return batch size for the current step based on 3-phase schedule."""
-    x = step / hparams.num_iterations
-    if x >= 2/3:
-        return hparams.batch_sizes[2]
-    elif x >= 1/3:
-        return hparams.batch_sizes[1]
-    return hparams.batch_sizes[0]
-
-
 def get_lr(step: int) -> float:
-    """LR schedule: 3-phase with batch size scaling + cooldown."""
-    x = step / hparams.num_iterations
-    lr_max = 1.0
-    if x > 1/3:
-        lr_max = 1.52
-    if x > 2/3:
-        lr_max = 1.73
-    cd_start = 1 - hparams.cooldown_frac  # 0.45
-    if x >= cd_start:
-        w = (1 - x) / hparams.cooldown_frac
-        return lr_max * w + (1 - w) * 0.1
-    return lr_max
+    """LR schedule: linear warmup then cosine decay to 0.1."""
+    warmup_steps = max(1, int(hparams.warmup_frac * hparams.num_iterations))
+    if step < warmup_steps:
+        return step / warmup_steps
+    t = (step - warmup_steps) / (hparams.num_iterations - warmup_steps)
+    return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * t))
 
 
 def get_muon_momentum(step: int, warmup_steps=300, cooldown_steps=50, mom_min=0.85, mom_max=0.95):
@@ -1037,8 +1022,7 @@ training_manager = TrainingManager(model)
 
 ########################################
 #            Warmup kernels            #
-########################################
-print0("Compiling model and warming up kernels...", console=True)
+######################################## print0("Compiling model and warming up kernels...", console=True)
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizer=training_manager.get_state())
 
@@ -1046,22 +1030,21 @@ initial_state = dict(model=copy.deepcopy(model.state_dict()),
 warmup_val_loader = distributed_data_generator(hparams.val_files, hparams.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
 
 warmup_step = 0
-for bs in hparams.batch_sizes:
-    warmup_train_loader = distributed_data_generator(hparams.train_files, bs, train_max_seq_len, grad_accum_steps=grad_accum_steps)
-    for _ in range(2):
-        model.eval()
-        with torch.no_grad():
-            inputs, targets, cum_seqlens = next(warmup_val_loader)
-            model(inputs, targets, cum_seqlens)
-        model.train()
-        for idx in range(grad_accum_steps):
-            inputs, targets, cum_seqlens = next(warmup_train_loader)
-            loss = model(inputs, targets, cum_seqlens) * grad_scale
-            loss.backward()
-            del loss
-        training_manager.step_optimizers(warmup_step)
-        warmup_step += 1
-    del warmup_train_loader
+warmup_train_loader = distributed_data_generator(hparams.train_files, hparams.batch_size, train_max_seq_len, grad_accum_steps=grad_accum_steps)
+for _ in range(2):
+    model.eval()
+    with torch.no_grad():
+        inputs, targets, cum_seqlens = next(warmup_val_loader)
+        model(inputs, targets, cum_seqlens)
+    model.train()
+    for idx in range(grad_accum_steps):
+        inputs, targets, cum_seqlens = next(warmup_train_loader)
+        loss = model(inputs, targets, cum_seqlens) * grad_scale
+        loss.backward()
+        del loss
+    training_manager.step_optimizers(warmup_step)
+    warmup_step += 1
+del warmup_train_loader
 
 print0("Resetting model after warmup", console=True)
 model.zero_grad(set_to_none=True)
@@ -1073,10 +1056,7 @@ model.train()
 ########################################
 #        Training and validation       #
 ########################################
-# Phase boundaries for 3-phase batch size schedule
-phase_boundaries = [0, hparams.num_iterations // 3, 2 * hparams.num_iterations // 3]
-current_phase = -1
-train_loader = None
+train_loader = distributed_data_generator(hparams.train_files, hparams.batch_size, train_max_seq_len, grad_accum_steps=grad_accum_steps)
 
 gc.collect()
 best_val_loss = float('inf')
@@ -1087,16 +1067,6 @@ t0 = time.perf_counter()
 train_steps = hparams.num_iterations
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
-
-    # Switch batch size at phase transitions
-    if not last_step:
-        bs = get_batch_size(step)
-        phase = 0 if step < phase_boundaries[1] else (1 if step < phase_boundaries[2] else 2)
-        if phase != current_phase:
-            current_phase = phase
-            train_loader = distributed_data_generator(hparams.train_files, bs, train_max_seq_len, grad_accum_steps=grad_accum_steps)
-            if master_process:
-                print(f"Phase {phase}: batch_size={bs} starting at step {step}")
 
     # --------------- VALIDATION SECTION -----------------
     if last_step or (hparams.val_loss_every > 0 and step % hparams.val_loss_every == 0):
