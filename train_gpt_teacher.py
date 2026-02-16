@@ -879,7 +879,7 @@ class TeacherHyperparameters:
     # schedule
     num_iterations: int = int(os.environ.get("NUM_ITERATIONS", 250))
     cooldown_frac: float = float(os.environ.get("COOLDOWN_FRAC", 0.55))
-    batch_size: int = 8 * 2048 * 8  # 131072 tokens (W0 only)
+    batch_sizes: tuple = (8 * 2048 * 8, 16 * 2048 * 8, 24 * 2048 * 8)  # 3-phase: (131072, 262144, 393216)
     # logging and checkpoints
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 25))
@@ -890,13 +890,29 @@ hparams = TeacherHyperparameters()
 train_max_seq_len = 896  # fixed for teacher (always in W0)
 
 
+def get_batch_size(step: int) -> int:
+    """Return batch size for the current step based on 3-phase schedule."""
+    x = step / hparams.num_iterations
+    if x >= 2/3:
+        return hparams.batch_sizes[2]
+    elif x >= 1/3:
+        return hparams.batch_sizes[1]
+    return hparams.batch_sizes[0]
+
+
 def get_lr(step: int) -> float:
-    """LR schedule: flat then cooldown."""
-    cd_start = int(hparams.num_iterations * (1 - hparams.cooldown_frac))
-    if step >= cd_start:
-        t = min(1.0, (step - cd_start) / (hparams.num_iterations - cd_start))
-        return 1.0 * (1 - t) + 0.15 * t
-    return 1.0
+    """LR schedule: 3-phase with batch size scaling + cooldown."""
+    x = step / hparams.num_iterations
+    lr_max = 1.0
+    if x > 1/3:
+        lr_max = 1.52
+    if x > 2/3:
+        lr_max = 1.73
+    cd_start = 1 - hparams.cooldown_frac  # 0.45
+    if x >= cd_start:
+        w = (1 - x) / hparams.cooldown_frac
+        return lr_max * w + (1 - w) * 0.1
+    return lr_max
 
 
 def get_muon_momentum(step: int, warmup_steps=300, cooldown_steps=50, mom_min=0.85, mom_max=0.95):
@@ -969,8 +985,8 @@ class TrainingManager:
 logfile = None
 if master_process:
     run_id = hparams.run_id
-    os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{run_id}.txt"
+    os.makedirs("logs/dev", exist_ok=True)
+    logfile = f"logs/dev/{run_id}.txt"
     print(logfile)
 
 def print0(s, console=False):
@@ -1026,34 +1042,41 @@ print0("Compiling model and warming up kernels...", console=True)
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizer=training_manager.get_state())
 
-# Warmup: run a few train + val steps to trigger compilation
-warmup_train_loader = distributed_data_generator(hparams.train_files, hparams.batch_size, train_max_seq_len, grad_accum_steps=grad_accum_steps)
+# Warmup: run a few train + val steps to trigger compilation for all batch sizes
 warmup_val_loader = distributed_data_generator(hparams.val_files, hparams.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
 
-for step in [0, 1]:
-    model.eval()
-    with torch.no_grad():
-        inputs, targets, cum_seqlens = next(warmup_val_loader)
-        model(inputs, targets, cum_seqlens)
-    model.train()
-    for idx in range(grad_accum_steps):
-        inputs, targets, cum_seqlens = next(warmup_train_loader)
-        loss = model(inputs, targets, cum_seqlens) * grad_scale
-        loss.backward()
-        del loss
-    training_manager.step_optimizers(step)
+warmup_step = 0
+for bs in hparams.batch_sizes:
+    warmup_train_loader = distributed_data_generator(hparams.train_files, bs, train_max_seq_len, grad_accum_steps=grad_accum_steps)
+    for _ in range(2):
+        model.eval()
+        with torch.no_grad():
+            inputs, targets, cum_seqlens = next(warmup_val_loader)
+            model(inputs, targets, cum_seqlens)
+        model.train()
+        for idx in range(grad_accum_steps):
+            inputs, targets, cum_seqlens = next(warmup_train_loader)
+            loss = model(inputs, targets, cum_seqlens) * grad_scale
+            loss.backward()
+            del loss
+        training_manager.step_optimizers(warmup_step)
+        warmup_step += 1
+    del warmup_train_loader
 
 print0("Resetting model after warmup", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
 training_manager.reset(initial_state["optimizer"])
-del warmup_val_loader, warmup_train_loader, initial_state
+del warmup_val_loader, initial_state
 model.train()
 
 ########################################
 #        Training and validation       #
 ########################################
-train_loader = distributed_data_generator(hparams.train_files, hparams.batch_size, train_max_seq_len, grad_accum_steps=grad_accum_steps)
+# Phase boundaries for 3-phase batch size schedule
+phase_boundaries = [0, hparams.num_iterations // 3, 2 * hparams.num_iterations // 3]
+current_phase = -1
+train_loader = None
 
 gc.collect()
 best_val_loss = float('inf')
@@ -1064,6 +1087,16 @@ t0 = time.perf_counter()
 train_steps = hparams.num_iterations
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
+
+    # Switch batch size at phase transitions
+    if not last_step:
+        bs = get_batch_size(step)
+        phase = 0 if step < phase_boundaries[1] else (1 if step < phase_boundaries[2] else 2)
+        if phase != current_phase:
+            current_phase = phase
+            train_loader = distributed_data_generator(hparams.train_files, bs, train_max_seq_len, grad_accum_steps=grad_accum_steps)
+            if master_process:
+                print(f"Phase {phase}: batch_size={bs} starting at step {step}")
 
     # --------------- VALIDATION SECTION -----------------
     if last_step or (hparams.val_loss_every > 0 and step % hparams.val_loss_every == 0):
