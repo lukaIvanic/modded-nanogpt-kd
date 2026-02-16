@@ -1022,7 +1022,8 @@ training_manager = TrainingManager(model)
 
 ########################################
 #            Warmup kernels            #
-######################################## print0("Compiling model and warming up kernels...", console=True)
+########################################
+print0("Compiling model and warming up kernels...", console=True)
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizer=training_manager.get_state())
 
