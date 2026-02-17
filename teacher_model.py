@@ -219,7 +219,8 @@ def load_teacher(checkpoint_path: str, device: torch.device, max_seq_len: int = 
     # Our model may have different shapes. Use strict=False and handle manually.
     state = ckpt['model']
 
-    # Filter out padding: only load the actual layers
+    # Strip _orig_mod. prefix added by torch.compile
+    state = {k.removeprefix('_orig_mod.'): v for k, v in state.items()}
     teacher.load_state_dict(state, strict=True)
 
     teacher.to(device=device, dtype=torch.bfloat16)
