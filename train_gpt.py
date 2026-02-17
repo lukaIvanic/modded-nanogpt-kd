@@ -1953,13 +1953,14 @@ train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].b
 
 gc.collect()
 
-# One-time teacher sanity check on validation data
+# One-time teacher sanity check on validation data (use training batch size to avoid OOM)
 print0("Running teacher validation sanity check...", console=True)
+_teacher_batch = TRAINING_STAGES[0].batch_size
 with torch.no_grad():
-    _val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
-    _val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
+    _val_loader = distributed_data_generator(args.val_files, _teacher_batch, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+    _val_steps = grad_accum_steps * args.val_tokens // _teacher_batch
     _teacher_val_loss = 0
-    _max_len = args.val_batch_size // (grad_accum_steps * world_size)
+    _max_len = _teacher_batch // (grad_accum_steps * world_size)
     for _ in range(_val_steps):
         inputs, targets, cum_seqlens, _, _ = next(_val_loader)
         _teacher_val_loss += teacher_model.get_loss(inputs, targets, cum_seqlens, _max_len)
