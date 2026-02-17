@@ -220,7 +220,7 @@ def load_teacher(checkpoint_path: str, device: torch.device, max_seq_len: int = 
     state = ckpt['model']
 
     # Filter out padding: only load the actual layers
-    teacher.load_state_dict(state, strict=False)
+    teacher.load_state_dict(state, strict=True)
 
     teacher.to(device=device, dtype=torch.bfloat16)
     teacher.eval()
