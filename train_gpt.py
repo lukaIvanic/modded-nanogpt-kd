@@ -36,6 +36,7 @@ from kernels import get_kernel
 from torch import Tensor, nn
 
 from triton_kernels import XXT, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy
+from teacher_model import TeacherGPT, load_teacher
 
 dynamo.config.recompile_limit = 64
 
@@ -1135,10 +1136,11 @@ class ForwardScheduleConfig:
     train_max_seq_len: int
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int, kd_mode: bool = False):
         super().__init__()
         self.num_layers = num_layers
         self.vocab_size = next_multiple_of_n(vocab_size, n=128)
+        self.kd_mode = kd_mode  # when True, forward returns (loss, logits)
 
         self.smear_gate = nn.Linear(12, 1, bias=False)
         nn.init.zeros_(self.smear_gate.weight)
@@ -1349,6 +1351,11 @@ class GPT(nn.Module):
         if self.training:
             losses = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s)
             loss = losses.sum()
+            if self.kd_mode:
+                # Extra lm_head pass to get logits for KD (with gradients, in bfloat16)
+                logits = self.lm_head(x)
+                logits = 23 * torch.sigmoid((logits + 5) / 7.5)
+                return loss, logits
         else:
             logits = self.lm_head(x)
             logits = 23 * torch.sigmoid((logits + 5) / 7.5)
@@ -1558,6 +1565,10 @@ class Hyperparameters:
     save_checkpoint: bool = False
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
+    # knowledge distillation
+    kd_alpha_hard: float = float(os.environ.get("KD_ALPHA_HARD", "1.0"))
+    kd_alpha_soft: float = float(os.environ.get("KD_ALPHA_SOFT", "0.0"))
+    kd_temperature: float = float(os.environ.get("KD_TEMPERATURE", "1.0"))
 
 args = Hyperparameters()
 
@@ -1871,7 +1882,8 @@ model: nn.Module = GPT(
     num_heads=6,
     head_dim=128,
     model_dim=768,
-    max_seq_len=args.val_batch_size // (grad_accum_steps * world_size)
+    max_seq_len=args.val_batch_size // (grad_accum_steps * world_size),
+    kd_mode=(args.kd_alpha_soft > 0)
 ).cuda()
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
@@ -1886,6 +1898,14 @@ for param in model.parameters():
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
 
+########################################
+#          Load teacher model          #
+########################################
+teacher_checkpoint = os.environ.get("TEACHER_CHECKPOINT", "checkpoints/teacher/state_best.pt")
+print0(f"Loading teacher from {teacher_checkpoint}", console=True)
+teacher_model = load_teacher(teacher_checkpoint, device, max_seq_len=args.val_batch_size // (grad_accum_steps * world_size))
+print0(f"Teacher loaded: {teacher_model.num_layers}L, vocab={teacher_model.vocab_size}", console=True)
+print0(f"KD config: alpha_hard={args.kd_alpha_hard} alpha_soft={args.kd_alpha_soft} temperature={args.kd_temperature}", console=True)
 
 ########################################
 #            Warmup kernels            #
@@ -1912,10 +1932,11 @@ for step in warmup_steps:
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
         training_manager.sparse_index_update(step, bigram_cpu)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) * grad_scale
+        out = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+        loss = (out[0] if args.kd_alpha_soft > 0 else out) * grad_scale
         training_manager.sparse_index_share(step)
         loss.backward()
-        del loss
+        del loss, out
     training_manager.step_optimizers(step)
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
@@ -1930,6 +1951,21 @@ model.train()
 train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
 
 gc.collect()
+
+# One-time teacher sanity check on validation data
+print0("Running teacher validation sanity check...", console=True)
+with torch.no_grad():
+    _val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+    _val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
+    _teacher_val_loss = 0
+    _max_len = args.val_batch_size // (grad_accum_steps * world_size)
+    for _ in range(_val_steps):
+        inputs, targets, cum_seqlens, _, _ = next(_val_loader)
+        _teacher_val_loss += teacher_model.get_loss(inputs, targets, cum_seqlens, _max_len)
+    _teacher_val_loss /= _val_steps
+    dist.reduce(_teacher_val_loss, 0, op=dist.ReduceOp.AVG)
+    print0(f"Teacher val_loss: {_teacher_val_loss:.4f}", console=True)
+    del _val_loader
 
 training_time_ms = 0
 # start the clock
@@ -1975,10 +2011,21 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
+    last_soft_loss = 0.0
     for idx in range(grad_accum_steps):
         inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
         training_manager.sparse_index_update(step, bigram_cpu)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) * grad_scale
+
+        if args.kd_alpha_soft > 0:
+            hard_loss, student_logits = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+            max_len = training_manager.get_forward_args().train_max_seq_len
+            soft_loss = teacher_model.get_kd_loss(inputs, student_logits, cum_seqlens, max_len, args.kd_temperature)
+            last_soft_loss = soft_loss.item()
+            loss = (args.kd_alpha_hard * hard_loss + args.kd_alpha_soft * soft_loss) * grad_scale
+            del student_logits, soft_loss, hard_loss
+        else:
+            loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) * grad_scale
+
         training_manager.sparse_index_share(step)
         loss.backward()
         del loss
@@ -1987,7 +2034,8 @@ for step in range(train_steps + 1):
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     step_lr_mul = training_schedule.get_lr(step)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms lr_mul:{step_lr_mul:.4f} muon_lr:{step_lr_mul*0.023:.6f} adam_lr:{step_lr_mul*0.008:.6f}", console=True)
+    kd_log = f" soft_loss:{last_soft_loss:.4f}" if args.kd_alpha_soft > 0 else ""
+    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms lr_mul:{step_lr_mul:.4f} muon_lr:{step_lr_mul*0.023:.6f} adam_lr:{step_lr_mul*0.008:.6f}{kd_log}", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
