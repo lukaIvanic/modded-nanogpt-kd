@@ -187,17 +187,39 @@ class TeacherGPT(nn.Module):
         with torch.no_grad():
             teacher_logits = self.forward(input_seq, cum_seqlens, max_len)
 
+        _debug = not hasattr(self, '_dbg_count')
+        if _debug:
+            self._dbg_count = 0
+        self._dbg_count += 1
+        _show = self._dbg_count <= 160  # ~20 steps * 8 accum
+
+        if _show:
+            print(f"[DEBUG kd] teacher_logits dtype={teacher_logits.dtype} shape={teacher_logits.shape} absmax={teacher_logits.abs().max().item():.4f} mean={teacher_logits.mean().item():.4f} std={teacher_logits.std().item():.4f}")
+            print(f"[DEBUG kd] student_logits dtype={student_logits.dtype} shape={student_logits.shape} absmax={student_logits.abs().max().item():.4f} mean={student_logits.mean().item():.4f} std={student_logits.std().item():.4f}")
+
         # Flatten to (seq_len, vocab_size)
         t = (teacher_logits.view(-1, teacher_logits.size(-1)) / temperature).float()
         s = (student_logits.view(-1, student_logits.size(-1)) / temperature).float()
 
+        if _show:
+            print(f"[DEBUG kd] t dtype={t.dtype} absmax={t.abs().max().item():.4f}")
+            print(f"[DEBUG kd] s dtype={s.dtype} absmax={s.abs().max().item():.4f} requires_grad={s.requires_grad}")
+
+        s_log = F.log_softmax(s, dim=-1)
+        t_log = F.log_softmax(t, dim=-1)
+        if _show:
+            print(f"[DEBUG kd] s_log_softmax min={s_log.min().item():.4f} max={s_log.max().item():.4f}")
+            print(f"[DEBUG kd] t_log_softmax min={t_log.min().item():.4f} max={t_log.max().item():.4f}")
+
         kd_loss = F.kl_div(
-            F.log_softmax(s, dim=-1),
-            F.log_softmax(t, dim=-1),
+            s_log,
+            t_log,
             log_target=True,
             reduction='batchmean',
         ) * (temperature ** 2)
 
+        if _show:
+            print(f"[DEBUG kd] kd_loss={kd_loss.item():.6f} dtype={kd_loss.dtype} requires_grad={kd_loss.requires_grad}")
         return kd_loss
 
 

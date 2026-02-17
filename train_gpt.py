@@ -1355,6 +1355,7 @@ class GPT(nn.Module):
             if self.kd_mode:
                 # Extra lm_head pass to get raw logits for KD (no softcap — matches upstream)
                 logits = self.lm_head(x).float()
+                # NOTE: debug prints are in training loop (can't print inside torch.compile)
                 return loss, logits
         else:
             logits = self.lm_head(x)
@@ -2019,10 +2020,15 @@ for step in range(train_steps + 1):
 
         if args.kd_alpha_soft > 0:
             hard_loss, student_logits = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+            if step < 20:
+                print(f"[DEBUG student] step={step} idx={idx} logits dtype={student_logits.dtype} shape={student_logits.shape} absmax={student_logits.abs().max().item():.4f} mean={student_logits.mean().item():.4f} std={student_logits.std().item():.4f} requires_grad={student_logits.requires_grad}")
+                print(f"[DEBUG student] hard_loss={hard_loss.item():.4f} dtype={hard_loss.dtype}")
             max_len = training_manager.get_forward_args().train_max_seq_len
             soft_loss = teacher_model.get_kd_loss(inputs, student_logits, cum_seqlens, max_len, args.kd_temperature)
             last_soft_loss = soft_loss.item()
             loss = (args.kd_alpha_hard * hard_loss + args.kd_alpha_soft * soft_loss) * grad_scale
+            if step < 20:
+                print(f"[DEBUG loop] step={step} idx={idx} hard_loss={hard_loss.item():.4f} soft_loss={soft_loss.item():.6f} combined_loss={loss.item():.6f} grad_scale={grad_scale}")
             del student_logits, soft_loss, hard_loss
         else:
             loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) * grad_scale
