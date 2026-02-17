@@ -215,7 +215,7 @@ class TeacherGPT(nn.Module):
             s_log,
             t_log,
             log_target=True,
-            reduction='batchmean',
+            reduction='sum',
         ) * (temperature ** 2)
 
         if _show:
