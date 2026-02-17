@@ -36,7 +36,7 @@ from kernels import get_kernel
 from torch import Tensor, nn
 
 from triton_kernels import XXT, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy
-from teacher_model import TeacherGPT, load_teacher, set_flash_attn_interface
+from teacher_model import TeacherGPT, load_teacher, set_flash_attn_interface, apply_kd_dynamic_norm
 
 dynamo.config.recompile_limit = 64
 
@@ -1570,6 +1570,7 @@ class Hyperparameters:
     kd_alpha_hard: float = float(os.environ.get("KD_ALPHA_HARD", "1.0"))
     kd_alpha_soft: float = float(os.environ.get("KD_ALPHA_SOFT", "0.0"))
     kd_temperature: float = float(os.environ.get("KD_TEMPERATURE", "1.0"))
+    kd_dynamic_norm: bool = bool(int(os.environ.get("KD_DYNAMIC_NORM", "1")))
 
 args = Hyperparameters()
 
@@ -1906,7 +1907,7 @@ teacher_checkpoint = os.environ.get("TEACHER_CHECKPOINT", "checkpoints/teacher/s
 print0(f"Loading teacher from {teacher_checkpoint}", console=True)
 teacher_model = load_teacher(teacher_checkpoint, device, max_seq_len=args.val_batch_size // (grad_accum_steps * world_size))
 print0(f"Teacher loaded: {teacher_model.num_layers}L, vocab={teacher_model.vocab_size}", console=True)
-print0(f"KD config: alpha_hard={args.kd_alpha_hard} alpha_soft={args.kd_alpha_soft} temperature={args.kd_temperature}", console=True)
+print0(f"KD config: alpha_hard={args.kd_alpha_hard} alpha_soft={args.kd_alpha_soft} temperature={args.kd_temperature} dynamic_norm={args.kd_dynamic_norm}", console=True)
 
 ########################################
 #            Warmup kernels            #
@@ -1975,6 +1976,7 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = training_schedule.total_steps
+kd_enabled = args.kd_alpha_soft > 0  # global KD switch, disabled when student catches teacher
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
@@ -1999,6 +2001,12 @@ for step in range(train_steps + 1):
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         step_lr_mul = training_schedule.get_lr(step)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms lr_mul:{step_lr_mul:.4f} muon_lr:{step_lr_mul*0.023:.6f} adam_lr:{step_lr_mul*0.008:.6f}", console=True)
+        # Disable KD when student approaches teacher quality
+        if kd_enabled and val_loss < _teacher_val_loss + 0.05:
+            kd_enabled = False
+            del teacher_model
+            teacher_model = None
+            print0(f"KD disabled at step {step}: val_loss {val_loss:.4f} < teacher {_teacher_val_loss:.4f} + 0.05", console=True)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -2018,7 +2026,7 @@ for step in range(train_steps + 1):
         inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
         training_manager.sparse_index_update(step, bigram_cpu)
 
-        if args.kd_alpha_soft > 0:
+        if kd_enabled:
             hard_loss, student_logits = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
             if step < 20:
                 print(f"[DEBUG student] step={step} idx={idx} logits dtype={student_logits.dtype} shape={student_logits.shape} absmax={student_logits.abs().max().item():.4f} mean={student_logits.mean().item():.4f} std={student_logits.std().item():.4f} requires_grad={student_logits.requires_grad}")
@@ -2026,12 +2034,16 @@ for step in range(train_steps + 1):
             max_len = training_manager.get_forward_args().train_max_seq_len
             soft_loss = teacher_model.get_kd_loss(inputs, student_logits, cum_seqlens, max_len, args.kd_temperature)
             last_soft_loss = soft_loss.item()
+            if args.kd_dynamic_norm:
+                soft_loss = apply_kd_dynamic_norm(hard_loss, soft_loss)
             loss = (args.kd_alpha_hard * hard_loss + args.kd_alpha_soft * soft_loss) * grad_scale
             if step < 20:
                 print(f"[DEBUG loop] step={step} idx={idx} hard_loss={hard_loss.item():.4f} soft_loss={soft_loss.item():.6f} combined_loss={loss.item():.6f} grad_scale={grad_scale}")
             del student_logits, soft_loss, hard_loss
         else:
-            loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) * grad_scale
+            result = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+            # kd_mode model returns (loss, logits) even after KD is disabled
+            loss = (result[0] if isinstance(result, tuple) else result) * grad_scale
 
         training_manager.sparse_index_share(step)
         loss.backward()

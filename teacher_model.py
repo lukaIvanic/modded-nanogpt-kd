@@ -223,6 +223,13 @@ class TeacherGPT(nn.Module):
         return kd_loss
 
 
+def apply_kd_dynamic_norm(hard_loss, soft_loss, eps=1e-8):
+    """Scale soft_loss to match hard_loss magnitude (per-step, detached)."""
+    ratio = hard_loss.detach() / (soft_loss.detach().abs() + eps)
+    scale = ratio.clamp_min(0.0)
+    return soft_loss * scale
+
+
 def load_teacher(checkpoint_path: str, device: torch.device, max_seq_len: int = 4096) -> TeacherGPT:
     """Load a pretrained teacher model from checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
