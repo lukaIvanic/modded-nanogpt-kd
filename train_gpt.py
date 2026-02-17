@@ -1353,9 +1353,10 @@ class GPT(nn.Module):
             losses = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s)
             loss = losses.sum()
             if self.kd_mode:
-                # Extra lm_head pass to get logits for KD (with gradients, in bfloat16)
+                # Extra lm_head pass to get logits for KD
+                # Cast to float32 so backward pass stays fp32 (bf16 gradients are too small for KL div)
                 logits = self.lm_head(x)
-                logits = 23 * torch.sigmoid((logits + 5) / 7.5)
+                logits = 23 * torch.sigmoid((logits.float() + 5) / 7.5)
                 return loss, logits
         else:
             logits = self.lm_head(x)
