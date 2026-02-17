@@ -52,7 +52,13 @@ class Yarn(nn.Module):
         self.attn_scale = 0.1
 
 
-flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+_flash_attn_interface = None
+
+def get_flash_attn_interface():
+    global _flash_attn_interface
+    if _flash_attn_interface is None:
+        _flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+    return _flash_attn_interface
 
 
 class CausalSelfAttention(nn.Module):
@@ -68,7 +74,7 @@ class CausalSelfAttention(nn.Module):
         q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k)
         q, k = yarn.rotary(q), yarn.rotary(k)
-        y = flash_attn_interface.flash_attn_varlen_func(
+        y = get_flash_attn_interface().flash_attn_varlen_func(
             q[0], k[0], v[0],
             cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
             max_seqlen_q=max_len, max_seqlen_k=max_len,
