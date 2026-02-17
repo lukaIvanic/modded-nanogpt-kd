@@ -138,7 +138,7 @@ class TeacherGPT(nn.Module):
         self.scalars = nn.Parameter(torch.zeros(num_scalars))
 
     def forward(self, input_seq: Tensor, cum_seqlens: Tensor, max_len: int):
-        """Returns softcapped logits in bfloat16. Shape: (1, seq_len, vocab_size)."""
+        """Returns raw (unsoftcapped) logits in bfloat16. Shape: (1, seq_len, vocab_size)."""
         resid_lambdas = self.scalars[:self.num_layers]
         x0_lambdas = self.x0_lambdas
         sa_lambdas = self.scalars[self.num_layers:3 * self.num_layers].view(-1, 2)
@@ -158,14 +158,14 @@ class TeacherGPT(nn.Module):
             x = self.blocks[i](x, cum_seqlens, max_len, self.yarn, sa_lambdas[i], attn_weights[i], mlp_fcs[i], mlp_projs[i])
 
         x = norm(x)
-        logits = self.lm_head(x)  # bfloat16
-        logits = 23 * torch.sigmoid((logits + 5) / 7.5)
+        logits = self.lm_head(x)  # bfloat16, raw (no softcap for KD)
         return logits
 
     @torch.no_grad()
     def get_loss(self, input_seq: Tensor, target_seq: Tensor, cum_seqlens: Tensor, max_len: int) -> Tensor:
         """Compute teacher cross-entropy loss (sanity check). Logits in bf16, CE in float."""
         logits = self.forward(input_seq, cum_seqlens, max_len)
+        logits = 23 * torch.sigmoid((logits + 5) / 7.5)  # softcap for CE
         return F.cross_entropy(logits.float().view(-1, logits.size(-1)), target_seq, reduction="mean")
 
     def get_kd_loss(self, input_seq: Tensor, student_logits: Tensor, cum_seqlens: Tensor, max_len: int, temperature: float = 1.0) -> Tensor:
