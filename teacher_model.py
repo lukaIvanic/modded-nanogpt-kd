@@ -222,7 +222,7 @@ def load_teacher(checkpoint_path: str, device: torch.device, max_seq_len: int = 
     # Filter out padding: only load the actual layers
     teacher.load_state_dict(state, strict=False)
 
-    teacher.to(device)
+    teacher.to(device=device, dtype=torch.bfloat16)
     teacher.eval()
     teacher.requires_grad_(False)
     return teacher
