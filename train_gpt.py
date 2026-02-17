@@ -36,7 +36,7 @@ from kernels import get_kernel
 from torch import Tensor, nn
 
 from triton_kernels import XXT, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy
-from teacher_model import TeacherGPT, load_teacher
+from teacher_model import TeacherGPT, load_teacher, set_flash_attn_interface
 
 dynamo.config.recompile_limit = 64
 
@@ -1023,6 +1023,7 @@ class AttnArgs:
     train_max_seq_len: torch.Tensor
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+set_flash_attn_interface(flash_attn_interface)
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False):
