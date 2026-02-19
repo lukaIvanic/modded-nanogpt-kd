@@ -36,7 +36,7 @@ from kernels import get_kernel
 from torch import Tensor, nn
 
 from triton_kernels import XXT, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy
-from teacher_model import TeacherGPT, load_teacher, load_student_as_teacher, set_flash_attn_interface, apply_kd_dynamic_norm
+from teacher_model import apply_kd_dynamic_norm
 
 def env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
@@ -1035,7 +1035,6 @@ class AttnArgs:
     train_max_seq_len: torch.Tensor
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
-set_flash_attn_interface(flash_attn_interface)
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False):
@@ -1153,7 +1152,7 @@ class GPT(nn.Module):
         super().__init__()
         self.num_layers = num_layers
         self.vocab_size = next_multiple_of_n(vocab_size, n=128)
-        self.kd_mode = kd_mode  # when True, forward returns (loss, logits)
+        self.kd_mode = kd_mode  # legacy, ignored — use return_logits/return_loss instead
 
         self.smear_gate = nn.Linear(12, 1, bias=False)
         nn.init.zeros_(self.smear_gate.weight)
@@ -1267,7 +1266,7 @@ class GPT(nn.Module):
         )
         self.scalars.label = 'scalars'
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
+    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig, return_logits: bool = False, return_loss: bool = True):
         assert input_seq.ndim == 1
 
         # unpack schedule_cfg
@@ -1361,20 +1360,32 @@ class GPT(nn.Module):
         x = norm(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
-        if self.training:
-            losses = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s)
-            loss = losses.sum()
-            if self.kd_mode:
-                # Extra lm_head pass to get raw logits for KD (no softcap — matches upstream)
-                logits = self.lm_head(x).float()
-                # NOTE: debug prints are in training loop (can't print inside torch.compile)
-                return loss, logits
-        else:
+        loss = None
+        logits = None
+        if return_logits:
+            # KD path or teacher inference: compute logits once, use unfused CE
             logits = self.lm_head(x)
-            logits = 23 * torch.sigmoid((logits + 5) / 7.5)
-            logits_for_loss = logits.float()
-            loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
-        return loss
+            if return_loss:
+                if target_seq is None:
+                    raise ValueError("target_seq must be provided when return_loss=True")
+                logits_sc = (23 * torch.sigmoid((logits + 5) / 7.5)).float()
+                loss = F.cross_entropy(logits_sc.view(-1, logits_sc.size(-1)), target_seq, reduction="sum")
+        else:
+            # Pure CE path: use fused FP8 kernel (fast, no logits materialized)
+            if self.training:
+                losses = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s)
+                loss = losses.sum()
+            else:
+                logits_tmp = self.lm_head(x)
+                logits_sc = (23 * torch.sigmoid((logits_tmp + 5) / 7.5)).float()
+                loss = F.cross_entropy(logits_sc.view(-1, logits_sc.size(-1)), target_seq, reduction="mean")
+        if return_logits and return_loss:
+            return logits, loss
+        if return_logits:
+            return logits
+        if return_loss:
+            return loss
+        raise ValueError("At least one of return_logits or return_loss must be True.")
 # -----------------------------------------------------------------------------
 # Distributed data loader
 
@@ -1578,9 +1589,10 @@ class Hyperparameters:
     save_checkpoint: bool = False
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
-    # knowledge distillation
-    kd_alpha_hard: float = float(os.environ.get("KD_ALPHA_HARD", "1.0"))
-    kd_alpha_soft: float = float(os.environ.get("KD_ALPHA_SOFT", "0.0"))
+    # knowledge distillation (matching upstream pattern)
+    # KD_ALPHA: hard loss weight. soft loss gets (1 - alpha). Set KD_ALPHA_SOFT > 0 to enable KD.
+    kd_alpha_hard: float = float(os.environ.get("KD_ALPHA", "0.45"))
+    kd_alpha_soft: float = float(os.environ.get("KD_ALPHA_SOFT", "0.0"))  # >0 enables KD
     kd_temperature: float = float(os.environ.get("KD_TEMPERATURE", "1.0"))
     kd_dynamic_norm: bool = bool(int(os.environ.get("KD_DYNAMIC_NORM", "1")))
 
@@ -1898,7 +1910,7 @@ model: nn.Module = GPT(
     head_dim=128,
     model_dim=768,
     max_seq_len=args.val_batch_size // (grad_accum_steps * world_size),
-    kd_mode=(args.kd_alpha_soft > 0)
+    kd_mode=False  # legacy, return_logits used instead
 ).cuda()
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
@@ -1920,18 +1932,28 @@ teacher_model = None
 if args.kd_alpha_soft > 0:
     teacher_checkpoint = os.environ.get("TEACHER_CHECKPOINT", "checkpoints/teacher/state_best.pt")
     print0(f"Loading teacher from {teacher_checkpoint}", console=True)
-    _default_config = dict(vocab_size=50257, num_layers=11, num_heads=6, head_dim=128, model_dim=768)
     _max_seq = args.val_batch_size // (grad_accum_steps * world_size)
-    try:
-        teacher_model = load_teacher(teacher_checkpoint, device, max_seq_len=_max_seq, default_config=_default_config)
-    except ValueError as e:
-        if "Student architecture" in str(e):
-            print0("Using student architecture as teacher (self-distillation)", console=True)
-            teacher_model = load_student_as_teacher(teacher_checkpoint, device, _max_seq, GPT, attn_args_class=AttnArgs, config=_default_config)
-        else:
-            raise
-    print0(f"Teacher loaded: {teacher_model.num_layers}L, vocab={teacher_model.vocab_size}", console=True)
-    print0(f"KD config: alpha_hard={args.kd_alpha_hard} alpha_soft={args.kd_alpha_soft} temperature={args.kd_temperature} dynamic_norm={args.kd_dynamic_norm}", console=True)
+    # Load teacher as same GPT class (like upstream) — gets bigrams + schedule_cfg
+    teacher_model = GPT(
+        vocab_size=50257, num_layers=11, num_heads=6, head_dim=128, model_dim=768,
+        max_seq_len=_max_seq
+    ).cuda()
+    _ckpt = torch.load(teacher_checkpoint, map_location=device, weights_only=False)
+    _state = _ckpt['model']
+    _state = {k.removeprefix('_orig_mod.'): v for k, v in _state.items()}
+    _missing, _unexpected = teacher_model.load_state_dict(_state, strict=False)
+    print0(f"Teacher loaded: missing={len(_missing)} unexpected={len(_unexpected)} keys", console=True)
+    for m in teacher_model.modules():
+        if isinstance(m, (nn.Embedding, nn.Linear)):
+            m.weight.data = m.weight.data.bfloat16()
+    teacher_model.attn_gate_bank.data = teacher_model.attn_gate_bank.data.bfloat16()
+    teacher_model.ve_gate_bank.data = teacher_model.ve_gate_bank.data.bfloat16()
+    teacher_model.attn_bank.data = teacher_model.attn_bank.data.bfloat16()
+    teacher_model.mlp_bank.data = teacher_model.mlp_bank.data.bfloat16()
+    teacher_model.eval()
+    teacher_model.requires_grad_(False)
+    del _ckpt, _state
+    print0(f"KD config: alpha_soft={args.kd_alpha_soft} temperature={args.kd_temperature} dynamic_norm={args.kd_dynamic_norm}", console=True)
 else:
     print0("KD disabled (kd_alpha_soft=0), skipping teacher loading", console=True)
 
@@ -1990,11 +2012,20 @@ if teacher_model is not None:
         _val_steps = grad_accum_steps * args.val_tokens // _teacher_batch
         _teacher_val_loss = 0
         _max_len = _teacher_batch // (grad_accum_steps * world_size)
+        _w0 = TRAINING_STAGES[0]
         for _ in range(_val_steps):
-            inputs, targets, cum_seqlens, _, _ = next(_val_loader)
-            _teacher_val_loss += teacher_model.get_loss(inputs, targets, cum_seqlens, _max_len)
+            inputs, targets, cum_seqlens, bigram_inputs, _ = next(_val_loader)
+            _cfg = ForwardScheduleConfig(
+                mtp_weights=torch.ones(1, device=device),
+                ws_short=_w0.window_sizes[0] * 128,
+                ws_long=_w0.window_sizes[1] * 128,
+                train_max_seq_len=_w0.train_max_seq_len
+            )
+            _t_loss = teacher_model(inputs, targets, cum_seqlens, bigram_inputs, _cfg,
+                                     return_logits=False, return_loss=True)
+            _teacher_val_loss += _t_loss.item()
         _teacher_val_loss /= _val_steps
-        dist.reduce(_teacher_val_loss, 0, op=dist.ReduceOp.AVG)
+        dist.reduce(torch.tensor(_teacher_val_loss, device=device), 0, op=dist.ReduceOp.AVG)
         print0(f"Teacher val_loss: {_teacher_val_loss:.4f}", console=True)
         del _val_loader
 
@@ -2039,7 +2070,8 @@ if env_flag("DIAGNOSTIC_MODE", False):
 
         # Teacher logits (raw, no softcap)
         if teacher_model is not None:
-            _t_logits = teacher_model.forward(_inp, _cls, _diag_max_len)
+            _t_logits = teacher_model(_inp, None, _cls, _bi, _cfg,
+                                       return_logits=True, return_loss=False)
         else:
             _t_logits = None
 
@@ -2172,23 +2204,33 @@ for step in range(train_steps + 1):
         training_manager.sparse_index_update(step, bigram_cpu)
 
         if kd_enabled:
-            hard_loss, student_logits = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
-            if step < 20:
-                print(f"[DEBUG student] step={step} idx={idx} logits dtype={student_logits.dtype} shape={student_logits.shape} absmax={student_logits.abs().max().item():.4f} mean={student_logits.mean().item():.4f} std={student_logits.std().item():.4f} requires_grad={student_logits.requires_grad}")
-                print(f"[DEBUG student] hard_loss={hard_loss.item():.4f} dtype={hard_loss.dtype}")
-            max_len = training_manager.get_forward_args().train_max_seq_len
-            soft_loss = teacher_model.get_kd_loss(inputs, student_logits, cum_seqlens, max_len, args.kd_temperature)
+            # KD path: get logits + loss from student, get logits from teacher
+            student_logits, hard_loss = model(inputs, targets, cum_seqlens, bigram_inputs,
+                                               training_manager.get_forward_args(),
+                                               return_logits=True, return_loss=True)
+            with torch.no_grad():
+                teacher_logits = teacher_model(inputs, None, cum_seqlens, bigram_inputs,
+                                               training_manager.get_forward_args(),
+                                               return_logits=True, return_loss=False)
+            # Compute KD soft loss (batchmean reduction, matching upstream)
+            T = args.kd_temperature
+            s_log = F.log_softmax(student_logits.view(-1, student_logits.size(-1)) / T, dim=-1)
+            t_log = F.log_softmax(teacher_logits.float().view(-1, teacher_logits.size(-1)) / T, dim=-1)
+            soft_loss = F.kl_div(s_log, t_log.detach(), log_target=True, reduction='batchmean') * (T ** 2)
             last_soft_loss = soft_loss.item()
             if args.kd_dynamic_norm:
                 soft_loss = apply_kd_dynamic_norm(hard_loss, soft_loss)
-            loss = (args.kd_alpha_hard * hard_loss + args.kd_alpha_soft * soft_loss) * grad_scale
+            # Combine: alpha * hard + (1-alpha) * soft (upstream pattern)
+            _alpha = args.kd_alpha_hard  # acts as upstream's alpha
+            loss = (_alpha * hard_loss + (1.0 - _alpha) * soft_loss) * grad_scale
             if step < 20:
-                print(f"[DEBUG loop] step={step} idx={idx} hard_loss={hard_loss.item():.4f} soft_loss={soft_loss.item():.6f} combined_loss={loss.item():.6f} grad_scale={grad_scale}")
-            del student_logits, soft_loss, hard_loss
+                print(f"[DEBUG kd] step={step} idx={idx} hard={hard_loss.item():.2f} soft={last_soft_loss:.4f} combined={loss.item():.4f}")
+            del student_logits, teacher_logits, soft_loss, hard_loss
         else:
-            result = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
-            # kd_mode model returns (loss, logits) even after KD is disabled
-            loss = (result[0] if isinstance(result, tuple) else result) * grad_scale
+            # Pure CE path: fused FP8 kernel (fast)
+            loss = model(inputs, targets, cum_seqlens, bigram_inputs,
+                         training_manager.get_forward_args(),
+                         return_logits=False, return_loss=True) * grad_scale
 
         training_manager.sparse_index_share(step)
         loss.backward()
