@@ -2213,18 +2213,10 @@ for step in range(train_steps + 1):
 
         if kd_enabled:
             _alpha = args.kd_alpha_hard  # upstream's alpha: hard weight
-            _need_hard = _alpha > 0
-            # Get student logits (and optionally hard loss)
-            if _need_hard:
-                student_logits, hard_loss = model(inputs, targets, cum_seqlens, bigram_inputs,
-                                                   training_manager.get_forward_args(),
-                                                   return_logits=True, return_loss=True)
-            else:
-                # Soft-only: skip hard loss computation
-                student_logits = model(inputs, targets, cum_seqlens, bigram_inputs,
-                                        training_manager.get_forward_args(),
-                                        return_logits=True, return_loss=False)
-                hard_loss = None
+            # Always compute hard_loss (needed for dynamic_norm even in soft-only mode)
+            student_logits, hard_loss = model(inputs, targets, cum_seqlens, bigram_inputs,
+                                               training_manager.get_forward_args(),
+                                               return_logits=True, return_loss=True)
             # Get teacher logits
             with torch.no_grad():
                 teacher_logits = teacher_model(inputs, None, cum_seqlens, bigram_inputs,
@@ -2237,18 +2229,17 @@ for step in range(train_steps + 1):
             soft_loss = F.kl_div(s_log, t_log.detach(), log_target=True, reduction='sum') * (T ** 2)
             last_soft_loss = soft_loss.item()
             # Combine losses
-            if _need_hard:
-                if args.kd_dynamic_norm:
-                    soft_loss = apply_kd_dynamic_norm(hard_loss, soft_loss)
+            if args.kd_dynamic_norm:
+                soft_loss = apply_kd_dynamic_norm(hard_loss, soft_loss)
+            if _alpha > 0:
                 loss = (_alpha * hard_loss + (1.0 - _alpha) * soft_loss) * grad_scale
             else:
+                # Soft-only: hard_loss used for dynamic_norm but not in gradient
                 loss = soft_loss * grad_scale
             if step < 20:
                 _h = hard_loss.item() if hard_loss is not None else 0
                 print(f"[DEBUG kd] step={step} idx={idx} hard={_h:.2f} soft={last_soft_loss:.4f} combined={loss.item():.4f} alpha={_alpha}")
-            del student_logits, teacher_logits, soft_loss
-            if hard_loss is not None:
-                del hard_loss
+            del student_logits, teacher_logits, soft_loss, hard_loss
         else:
             # Pure CE path: fused FP8 kernel (fast)
             loss = model(inputs, targets, cum_seqlens, bigram_inputs,
