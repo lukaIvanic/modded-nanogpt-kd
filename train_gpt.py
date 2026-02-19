@@ -1982,11 +1982,10 @@ for step in warmup_steps:
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
         training_manager.sparse_index_update(step, bigram_cpu)
-        out = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
-        loss = (out[0] if args.kd_alpha_soft > 0 else out) * grad_scale
+        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) * grad_scale
         training_manager.sparse_index_share(step)
         loss.backward()
-        del loss, out
+        del loss
     training_manager.step_optimizers(step)
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
