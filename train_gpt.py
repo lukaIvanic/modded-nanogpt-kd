@@ -2007,50 +2007,28 @@ if env_flag("DIAGNOSTIC_MODE", False):
     print0("KD DIAGNOSTIC MODE", console=True)
     print0("=" * 60, console=True)
 
-    _diag_val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
-    _diag_val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
-    _diag_max_len = args.val_batch_size // (grad_accum_steps * world_size)
-
-    # ---- EXPERIMENT A: Model val_loss (proper forward vs wrapper if applicable) ----
-    print0("\n--- EXPERIMENT A: Model val_loss ---", console=True)
-    _loss_model = 0.0
+    # Use W0 training batch size (much smaller than val_batch_size, fits in memory)
     _w0 = TRAINING_STAGES[0]
-    with torch.no_grad():
-        for _i in range(_diag_val_steps):
-            _inp, _tgt, _cls, _bi, _ = next(_diag_val_loader)
-            _cfg = ForwardScheduleConfig(
-                mtp_weights=torch.ones(1, device=device),
-                ws_short=_w0.ws_short if hasattr(_w0, 'ws_short') else 1024,
-                ws_long=_w0.ws_long if hasattr(_w0, 'ws_long') else _diag_max_len,
-                train_max_seq_len=_diag_max_len
-            )
-            _result = model(_inp, _tgt, _cls, _bi, _cfg)
-            _loss = _result[0] if isinstance(_result, tuple) else _result
-            _loss_model += _loss.item()
-    _loss_model /= _diag_val_steps
-    print0(f"  Student model val_loss: {_loss_model:.4f}", console=True)
+    _diag_batch = _w0.batch_size
+    _diag_max_len = _diag_batch // (grad_accum_steps * world_size)
+    print0(f"  Using W0 batch_size={_diag_batch}, max_seq_len={_diag_max_len}", console=True)
 
-    if teacher_model is not None:
-        # Teacher val_loss via wrapper
-        _loss_teacher_w = 0.0
-        _diag_val_loader2 = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
-        with torch.no_grad():
-            for _i in range(_diag_val_steps):
-                _inp, _tgt, _cls, _bi, _ = next(_diag_val_loader2)
-                _loss_teacher_w += teacher_model.get_loss(_inp, _tgt, _cls, _diag_max_len).item()
-        _loss_teacher_w /= _diag_val_steps
-        print0(f"  Teacher (wrapper) val_loss: {_loss_teacher_w:.4f}", console=True)
+    # ---- EXPERIMENT A: Teacher val_loss (already computed above) ----
+    print0("\n--- EXPERIMENT A: Teacher val_loss ---", console=True)
+    print0(f"  Teacher (wrapper) val_loss: {_teacher_val_loss:.4f} (from sanity check)", console=True)
+    print0(f"  CE baseline finished at 3.28 — delta={_teacher_val_loss - 3.28:.2f} shows wrapper degradation", console=True)
 
     # ---- EXPERIMENT B: Logit distribution analysis ----
     print0("\n--- EXPERIMENT B: Logit distribution analysis ---", console=True)
-    _diag_val_loader3 = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+    _diag_val_loader3 = distributed_data_generator(args.val_files, _diag_batch, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
     _inp, _tgt, _cls, _bi, _ = next(_diag_val_loader3)
 
     with torch.no_grad():
         # Student logits (kd_mode returns (loss, logits))
         _cfg = ForwardScheduleConfig(
             mtp_weights=torch.ones(1, device=device),
-            ws_short=1024, ws_long=_diag_max_len, train_max_seq_len=_diag_max_len
+            ws_short=_w0.window_sizes[0] * 128, ws_long=_w0.window_sizes[1] * 128,
+            train_max_seq_len=_w0.train_max_seq_len
         )
         _s_result = model(_inp, _tgt, _cls, _bi, _cfg)
         if isinstance(_s_result, tuple):
