@@ -36,7 +36,7 @@ from kernels import get_kernel
 from torch import Tensor, nn
 
 from triton_kernels import XXT, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy
-from teacher_model import TeacherGPT, load_teacher, set_flash_attn_interface, apply_kd_dynamic_norm
+from teacher_model import TeacherGPT, load_teacher, load_student_as_teacher, set_flash_attn_interface, apply_kd_dynamic_norm
 
 def env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
@@ -1921,7 +1921,15 @@ if args.kd_alpha_soft > 0:
     teacher_checkpoint = os.environ.get("TEACHER_CHECKPOINT", "checkpoints/teacher/state_best.pt")
     print0(f"Loading teacher from {teacher_checkpoint}", console=True)
     _default_config = dict(vocab_size=50257, num_layers=11, num_heads=6, head_dim=128, model_dim=768)
-    teacher_model = load_teacher(teacher_checkpoint, device, max_seq_len=args.val_batch_size // (grad_accum_steps * world_size), default_config=_default_config)
+    _max_seq = args.val_batch_size // (grad_accum_steps * world_size)
+    try:
+        teacher_model = load_teacher(teacher_checkpoint, device, max_seq_len=_max_seq, default_config=_default_config)
+    except ValueError as e:
+        if "Student architecture" in str(e):
+            print0("Using student architecture as teacher (self-distillation)", console=True)
+            teacher_model = load_student_as_teacher(teacher_checkpoint, device, _max_seq, GPT, attn_args_class=AttnArgs, config=_default_config)
+        else:
+            raise
     print0(f"Teacher loaded: {teacher_model.num_layers}L, vocab={teacher_model.vocab_size}", console=True)
     print0(f"KD config: alpha_hard={args.kd_alpha_hard} alpha_soft={args.kd_alpha_soft} temperature={args.kd_temperature} dynamic_norm={args.kd_dynamic_norm}", console=True)
 else:
