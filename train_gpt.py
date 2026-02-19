@@ -2233,7 +2233,7 @@ for step in range(train_steps + 1):
             T = args.kd_temperature
             s_log = F.log_softmax(student_logits.view(-1, student_logits.size(-1)) / T, dim=-1)
             t_log = F.log_softmax(teacher_logits.float().view(-1, teacher_logits.size(-1)) / T, dim=-1)
-            soft_loss = F.kl_div(s_log, t_log.detach(), log_target=True, reduction='batchmean') * (T ** 2)
+            soft_loss = F.kl_div(s_log, t_log.detach(), log_target=True, reduction='sum') * (T ** 2)
             last_soft_loss = soft_loss.item()
             # Combine losses
             if _need_hard:
