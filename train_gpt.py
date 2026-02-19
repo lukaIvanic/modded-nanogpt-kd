@@ -1920,7 +1920,8 @@ teacher_model = None
 if args.kd_alpha_soft > 0:
     teacher_checkpoint = os.environ.get("TEACHER_CHECKPOINT", "checkpoints/teacher/state_best.pt")
     print0(f"Loading teacher from {teacher_checkpoint}", console=True)
-    teacher_model = load_teacher(teacher_checkpoint, device, max_seq_len=args.val_batch_size // (grad_accum_steps * world_size))
+    _default_config = dict(vocab_size=50257, num_layers=11, num_heads=6, head_dim=128, model_dim=768)
+    teacher_model = load_teacher(teacher_checkpoint, device, max_seq_len=args.val_batch_size // (grad_accum_steps * world_size), default_config=_default_config)
     print0(f"Teacher loaded: {teacher_model.num_layers}L, vocab={teacher_model.vocab_size}", console=True)
     print0(f"KD config: alpha_hard={args.kd_alpha_hard} alpha_soft={args.kd_alpha_soft} temperature={args.kd_temperature} dynamic_norm={args.kd_dynamic_norm}", console=True)
 else:
@@ -2033,7 +2034,8 @@ for step in range(train_steps + 1):
 
     if last_step:
         if master_process and args.save_checkpoint:
-            log = dict(step=step, code=code, model=model.state_dict(), optimizer=training_manager.get_state())
+            log = dict(step=step, code=code, model=model.state_dict(), optimizer=training_manager.get_state(),
+                       config=dict(vocab_size=50257, num_layers=11, num_heads=6, head_dim=128, model_dim=768))
             ckpt_dir = os.environ.get("CKPT_DIR", f"logs/{run_id}")
             os.makedirs(ckpt_dir, exist_ok=True)
             torch.save(log, f"{ckpt_dir}/state_step{step:06d}.pt")
