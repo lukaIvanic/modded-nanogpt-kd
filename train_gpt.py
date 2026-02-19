@@ -1598,6 +1598,7 @@ class Hyperparameters:
 
 args = Hyperparameters()
 args.save_checkpoint = env_flag("SAVE_CHECKPOINT", args.save_checkpoint)
+args.val_loss_every = env_int("VAL_LOSS_EVERY", args.val_loss_every)
 
 @dataclass
 class TrainingStage:
