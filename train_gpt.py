@@ -1998,6 +1998,143 @@ if teacher_model is not None:
         print0(f"Teacher val_loss: {_teacher_val_loss:.4f}", console=True)
         del _val_loader
 
+########################################
+#        KD Diagnostic Mode           #
+########################################
+if env_flag("DIAGNOSTIC_MODE", False):
+    import numpy as np
+    print0("=" * 60, console=True)
+    print0("KD DIAGNOSTIC MODE", console=True)
+    print0("=" * 60, console=True)
+
+    _diag_val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+    _diag_val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
+    _diag_max_len = args.val_batch_size // (grad_accum_steps * world_size)
+
+    # ---- EXPERIMENT A: Model val_loss (proper forward vs wrapper if applicable) ----
+    print0("\n--- EXPERIMENT A: Model val_loss ---", console=True)
+    _loss_model = 0.0
+    _w0 = TRAINING_STAGES[0]
+    with torch.no_grad():
+        for _i in range(_diag_val_steps):
+            _inp, _tgt, _cls, _bi, _ = next(_diag_val_loader)
+            _cfg = ForwardScheduleConfig(
+                mtp_weights=torch.ones(1, device=device),
+                ws_short=_w0.ws_short if hasattr(_w0, 'ws_short') else 1024,
+                ws_long=_w0.ws_long if hasattr(_w0, 'ws_long') else _diag_max_len,
+                train_max_seq_len=_diag_max_len
+            )
+            _result = model(_inp, _tgt, _cls, _bi, _cfg)
+            _loss = _result[0] if isinstance(_result, tuple) else _result
+            _loss_model += _loss.item()
+    _loss_model /= _diag_val_steps
+    print0(f"  Student model val_loss: {_loss_model:.4f}", console=True)
+
+    if teacher_model is not None:
+        # Teacher val_loss via wrapper
+        _loss_teacher_w = 0.0
+        _diag_val_loader2 = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+        with torch.no_grad():
+            for _i in range(_diag_val_steps):
+                _inp, _tgt, _cls, _bi, _ = next(_diag_val_loader2)
+                _loss_teacher_w += teacher_model.get_loss(_inp, _tgt, _cls, _diag_max_len).item()
+        _loss_teacher_w /= _diag_val_steps
+        print0(f"  Teacher (wrapper) val_loss: {_loss_teacher_w:.4f}", console=True)
+
+    # ---- EXPERIMENT B: Logit distribution analysis ----
+    print0("\n--- EXPERIMENT B: Logit distribution analysis ---", console=True)
+    _diag_val_loader3 = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+    _inp, _tgt, _cls, _bi, _ = next(_diag_val_loader3)
+
+    with torch.no_grad():
+        # Student logits (kd_mode returns (loss, logits))
+        _cfg = ForwardScheduleConfig(
+            mtp_weights=torch.ones(1, device=device),
+            ws_short=1024, ws_long=_diag_max_len, train_max_seq_len=_diag_max_len
+        )
+        _s_result = model(_inp, _tgt, _cls, _bi, _cfg)
+        if isinstance(_s_result, tuple):
+            _s_logits = _s_result[1]
+        else:
+            print0("  WARNING: model not in kd_mode, cannot get student logits", console=True)
+            _s_logits = None
+
+        # Teacher logits (raw, no softcap)
+        if teacher_model is not None:
+            _t_logits = teacher_model.forward(_inp, _cls, _diag_max_len)
+        else:
+            _t_logits = None
+
+    if _s_logits is not None:
+        print0(f"\n  Student logits: shape={_s_logits.shape} dtype={_s_logits.dtype}", console=True)
+        print0(f"    absmax={_s_logits.abs().max().item():.2f} mean={_s_logits.mean().item():.4f} std={_s_logits.std().item():.4f}", console=True)
+    if _t_logits is not None:
+        print0(f"  Teacher logits: shape={_t_logits.shape} dtype={_t_logits.dtype}", console=True)
+        print0(f"    absmax={_t_logits.abs().max().item():.2f} mean={_t_logits.mean().item():.4f} std={_t_logits.std().item():.4f}", console=True)
+
+    if _t_logits is not None and _s_logits is not None:
+        for _T in [1.0, 2.0, 5.0, 10.0]:
+            _t_probs = F.softmax(_t_logits.float().view(-1, _t_logits.size(-1)) / _T, dim=-1)
+            _s_probs = F.softmax(_s_logits.float().view(-1, _s_logits.size(-1)) / _T, dim=-1)
+            _t_ent = -(_t_probs * _t_probs.clamp(min=1e-10).log()).sum(-1).mean().item() / np.log(2)
+            _s_ent = -(_s_probs * _s_probs.clamp(min=1e-10).log()).sum(-1).mean().item() / np.log(2)
+            _t_top1 = _t_probs.max(-1).values.mean().item()
+            _s_top1 = _s_probs.max(-1).values.mean().item()
+            print0(f"\n  T={_T:.1f}:", console=True)
+            print0(f"    Teacher: entropy={_t_ent:.2f} bits, top1_prob={_t_top1:.4f}", console=True)
+            print0(f"    Student: entropy={_s_ent:.2f} bits, top1_prob={_s_top1:.4f}", console=True)
+
+    # ---- EXPERIMENT C: KD loss sanity ----
+    if _t_logits is not None:
+        print0("\n--- EXPERIMENT C: KD loss sanity checks ---", console=True)
+        with torch.no_grad():
+            _t_flat = _t_logits.view(-1, _t_logits.size(-1)).float()
+            _num_tok = _t_flat.size(0)
+            _t_log = F.log_softmax(_t_flat, dim=-1)
+            _kl_self = F.kl_div(_t_log, _t_log, log_target=True, reduction='sum').item()
+            _kl_self_bm = F.kl_div(_t_log, _t_log, log_target=True, reduction='batchmean').item()
+            print0(f"\n  KL(teacher, teacher): sum={_kl_self:.6f}, batchmean={_kl_self_bm:.6f}", console=True)
+
+            _rand_logits = torch.randn_like(_t_flat) * 0.14
+            for _T in [1.0, 2.0, 5.0, 10.0]:
+                _r_log = F.log_softmax(_rand_logits / _T, dim=-1)
+                _t_log_T = F.log_softmax(_t_flat / _T, dim=-1)
+                _kl_sum = F.kl_div(_r_log, _t_log_T, log_target=True, reduction='sum').item() * (_T ** 2)
+                _kl_bm = F.kl_div(_r_log, _t_log_T, log_target=True, reduction='batchmean').item() * (_T ** 2)
+                print0(f"\n  KL(random, teacher) T={_T:.1f}: sum={_kl_sum:.2f}, batchmean={_kl_bm:.4f}, ratio={_kl_sum/_kl_bm:.1f} (tokens={_num_tok})", console=True)
+
+    # ---- EXPERIMENT D: Gradient direction ----
+    if _t_logits is not None and _s_logits is not None:
+        print0("\n--- EXPERIMENT D: Gradient direction — CE vs KD ---", console=True)
+        # Hard CE gradient
+        model.zero_grad(set_to_none=True)
+        _hard_loss, _s_log2 = model(_inp, _tgt, _cls, _bi, _cfg)
+        _hard_loss.backward()
+        _g_hard = torch.cat([p.grad.flatten().float() for p in model.parameters() if p.grad is not None])
+
+        for _T in [1.0, 2.0, 5.0]:
+            model.zero_grad(set_to_none=True)
+            _, _s_log3 = model(_inp, _tgt, _cls, _bi, _cfg)
+            _sf = _s_log3.view(-1, _s_log3.size(-1)) / _T
+            _tf = _t_logits.view(-1, _t_logits.size(-1)).float() / _T
+            _s_lsm = F.log_softmax(_sf, dim=-1)
+            _t_lsm = F.log_softmax(_tf, dim=-1)
+            _kd_l = F.kl_div(_s_lsm, _t_lsm.detach(), log_target=True, reduction='batchmean') * (_T ** 2)
+            _kd_l.backward()
+            _g_soft = torch.cat([p.grad.flatten().float() for p in model.parameters() if p.grad is not None])
+
+            _cos = F.cosine_similarity(_g_hard.unsqueeze(0), _g_soft.unsqueeze(0)).item()
+            _gh_n = _g_hard.norm().item()
+            _gs_n = _g_soft.norm().item()
+            print0(f"\n  T={_T:.1f}: cos_sim(g_hard, g_soft) = {_cos:.4f}", console=True)
+            print0(f"    |g_hard|={_gh_n:.4f}, |g_soft|={_gs_n:.4f}, ratio={_gs_n/_gh_n:.4f}", console=True)
+
+    print0("\n" + "=" * 60, console=True)
+    print0("DIAGNOSTICS COMPLETE", console=True)
+    print0("=" * 60, console=True)
+    dist.destroy_process_group()
+    sys.exit(0)
+
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
