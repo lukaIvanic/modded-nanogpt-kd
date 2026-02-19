@@ -2175,12 +2175,20 @@ for step in range(train_steps + 1):
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         step_lr_mul = training_schedule.get_lr(step)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms lr_mul:{step_lr_mul:.4f} muon_lr:{step_lr_mul*0.023:.6f} adam_lr:{step_lr_mul*0.008:.6f}", console=True)
-        # Disable KD when student approaches teacher quality
-        if kd_enabled and val_loss < _teacher_val_loss + 0.05:
-            kd_enabled = False
-            del teacher_model
-            teacher_model = None
-            print0(f"KD disabled at step {step}: val_loss {val_loss:.4f} < teacher {_teacher_val_loss:.4f} + 0.05", console=True)
+        # Disable KD: W0-only cutoff or val_loss threshold
+        _w0_end = training_schedule.boundaries[0][1]
+        _kd_w0_only = env_flag("KD_W0_ONLY", True)
+        if kd_enabled:
+            _disable_reason = None
+            if _kd_w0_only and step >= _w0_end:
+                _disable_reason = f"W0 ended at step {_w0_end}"
+            elif val_loss < _teacher_val_loss + 0.05:
+                _disable_reason = f"val_loss {val_loss:.4f} < teacher {_teacher_val_loss:.4f} + 0.05"
+            if _disable_reason:
+                kd_enabled = False
+                del teacher_model
+                teacher_model = None
+                print0(f"KD disabled at step {step}: {_disable_reason}", console=True)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -2203,10 +2211,20 @@ for step in range(train_steps + 1):
         training_manager.sparse_index_update(step, bigram_cpu)
 
         if kd_enabled:
-            # KD path: get logits + loss from student, get logits from teacher
-            student_logits, hard_loss = model(inputs, targets, cum_seqlens, bigram_inputs,
-                                               training_manager.get_forward_args(),
-                                               return_logits=True, return_loss=True)
+            _alpha = args.kd_alpha_hard  # upstream's alpha: hard weight
+            _need_hard = _alpha > 0
+            # Get student logits (and optionally hard loss)
+            if _need_hard:
+                student_logits, hard_loss = model(inputs, targets, cum_seqlens, bigram_inputs,
+                                                   training_manager.get_forward_args(),
+                                                   return_logits=True, return_loss=True)
+            else:
+                # Soft-only: skip hard loss computation
+                student_logits = model(inputs, targets, cum_seqlens, bigram_inputs,
+                                        training_manager.get_forward_args(),
+                                        return_logits=True, return_loss=False)
+                hard_loss = None
+            # Get teacher logits
             with torch.no_grad():
                 teacher_logits = teacher_model(inputs, None, cum_seqlens, bigram_inputs,
                                                training_manager.get_forward_args(),
@@ -2217,14 +2235,19 @@ for step in range(train_steps + 1):
             t_log = F.log_softmax(teacher_logits.float().view(-1, teacher_logits.size(-1)) / T, dim=-1)
             soft_loss = F.kl_div(s_log, t_log.detach(), log_target=True, reduction='batchmean') * (T ** 2)
             last_soft_loss = soft_loss.item()
-            if args.kd_dynamic_norm:
-                soft_loss = apply_kd_dynamic_norm(hard_loss, soft_loss)
-            # Combine: alpha * hard + (1-alpha) * soft (upstream pattern)
-            _alpha = args.kd_alpha_hard  # acts as upstream's alpha
-            loss = (_alpha * hard_loss + (1.0 - _alpha) * soft_loss) * grad_scale
+            # Combine losses
+            if _need_hard:
+                if args.kd_dynamic_norm:
+                    soft_loss = apply_kd_dynamic_norm(hard_loss, soft_loss)
+                loss = (_alpha * hard_loss + (1.0 - _alpha) * soft_loss) * grad_scale
+            else:
+                loss = soft_loss * grad_scale
             if step < 20:
-                print(f"[DEBUG kd] step={step} idx={idx} hard={hard_loss.item():.2f} soft={last_soft_loss:.4f} combined={loss.item():.4f}")
-            del student_logits, teacher_logits, soft_loss, hard_loss
+                _h = hard_loss.item() if hard_loss is not None else 0
+                print(f"[DEBUG kd] step={step} idx={idx} hard={_h:.2f} soft={last_soft_loss:.4f} combined={loss.item():.4f} alpha={_alpha}")
+            del student_logits, teacher_logits, soft_loss
+            if hard_loss is not None:
+                del hard_loss
         else:
             # Pure CE path: fused FP8 kernel (fast)
             loss = model(inputs, targets, cum_seqlens, bigram_inputs,
