@@ -19,6 +19,7 @@ Environment variables:
     BATCH_SIZE       (default: 8*2048*8 = 131072)
     WARMUP_FRAC      (default: 0.05)
     VAL_LOSS_EVERY   (default: 25)
+    GRAD_ACCUM_STEPS (default: 8)
     SAVE_CHECKPOINT  (default: 1)
     CHECKPOINT_DIR   (default: checkpoints/teacher)
     DATA_PATH        (default: .)
@@ -66,7 +67,7 @@ dynamo.config.recompile_limit = 64
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
 assert 8 % world_size == 0, "world_size must be a divisor of 8"
-grad_accum_steps = 8 // world_size
+grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", 8)) // world_size
 grad_scale = 1 / grad_accum_steps
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
