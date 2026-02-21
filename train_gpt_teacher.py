@@ -21,6 +21,7 @@ Environment variables:
     VAL_LOSS_EVERY   (default: 25)
     GRAD_ACCUM_STEPS (default: 8)
     VAL_BATCH_SIZE   (default: 4*64*1024 = 262144)
+    LR_SCALE         (default: 1.0)
     SAVE_CHECKPOINT  (default: 1)
     CHECKPOINT_DIR   (default: checkpoints/teacher)
     DATA_PATH        (default: .)
@@ -914,6 +915,8 @@ def get_muon_momentum(step: int, warmup_steps=300, cooldown_steps=50, mom_min=0.
 # -----------------------------------------------------------------------------
 # Training manager (simplified)
 
+lr_scale = float(os.environ.get("LR_SCALE", 1.0))
+
 class TrainingManager:
     def __init__(self, model):
         self.model = model
@@ -934,8 +937,8 @@ class TrainingManager:
             param_table=self.param_table,
             scatter_order=list(self.param_table.keys()),
             work_order=self.work_order,
-            adam_defaults=dict(lr=0.008, eps=1e-10, weight_decay=0.005),
-            normuon_defaults=dict(lr=0.023, momentum=0.95, beta2=0.95, weight_decay=1.2),
+            adam_defaults=dict(lr=0.008 * lr_scale, eps=1e-10, weight_decay=0.005),
+            normuon_defaults=dict(lr=0.023 * lr_scale, momentum=0.95, beta2=0.95, weight_decay=1.2),
         )
 
         # Split embed from lm_head at 2/3 of training
