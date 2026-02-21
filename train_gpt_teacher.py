@@ -16,10 +16,11 @@ Environment variables:
     NUM_HEADS        (default: 6)
     HEAD_DIM         (default: 128)
     NUM_ITERATIONS   (default: 250)
-    BATCH_SIZE       (default: 8*2048*8 = 131072)
+    BATCH_SIZE       (default: 8*896*8 = 57344)
     WARMUP_FRAC      (default: 0.05)
     VAL_LOSS_EVERY   (default: 25)
     GRAD_ACCUM_STEPS (default: 8)
+    VAL_BATCH_SIZE   (default: 4*64*1024 = 262144)
     SAVE_CHECKPOINT  (default: 1)
     CHECKPOINT_DIR   (default: checkpoints/teacher)
     DATA_PATH        (default: .)
@@ -873,14 +874,14 @@ class TeacherHyperparameters:
     train_files: str = os.path.join(os.environ.get("DATA_PATH", "."), "data/fineweb10B/fineweb_train_*.bin")
     val_files: str = os.path.join(os.environ.get("DATA_PATH", "."), "data/fineweb10B/fineweb_val_*.bin")
     val_tokens: int = 10485760
-    val_batch_size: int = 4 * 64 * 1024 * 8
+    val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", str(4 * 64 * 1024)))
     # architecture
     num_layers: int = int(os.environ.get("NUM_LAYERS", 3))
     num_heads: int = int(os.environ.get("NUM_HEADS", 6))
     head_dim: int = int(os.environ.get("HEAD_DIM", 128))
     # schedule
     num_iterations: int = int(os.environ.get("NUM_ITERATIONS", 250))
-    batch_size: int = int(os.environ.get("BATCH_SIZE", str(8 * 2048 * 8)))
+    batch_size: int = int(os.environ.get("BATCH_SIZE", str(8 * 896 * 8)))
     warmup_frac: float = float(os.environ.get("WARMUP_FRAC", "0.05"))
     # logging and checkpoints
     run_id: str = f"{uuid.uuid4()}"
